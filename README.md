@@ -1,45 +1,80 @@
-# NES Emulator Starter
+# NES Emulator
 
-This is a small, dependency-free NES emulator foundation written in Python 3.
+A small, dependency-free NES emulator written in Python 3. It includes a
+table-driven 6502 CPU, NES memory bus, PPU timing and software rendering,
+controller input, and a Tkinter window frontend.
 
-The project is split into focused modules under `nes/`:
+## Current capabilities
 
-- `rom.py` loads and validates iNES cartridges
-- `ppu.py` handles PPU registers, timing, and software rendering
-- `bus.py` handles CPU memory mapping and cartridge banks
-- `nes_emulator.py` is the single entry point and keeps the original public imports working
-It currently includes:
+- iNES ROM loading and validation
+- Mapper 0 (NROM) cartridges
+- Mapper 66 (GxROM) PRG and CHR bank switching
+- 6502 reset, interrupts, stack operations, branches, addressing modes, and
+  official instructions
+- Compatibility support for commonly encountered unofficial 6502 opcodes
+- CPU RAM mirroring and NES PPU register mapping
+- PPU nametable, attribute-table, palette, sprite, scrolling, and sprite-zero
+  timing support
+- OAM DMA through `$4014`
+- Controller polling through `$4016` and `$4017`
+- Interactive Tkinter display with keyboard controls
+- PNG and PPM frame output
 
-- iNES/NES 2.0 header parsing and mapper-0 (NROM) PRG loading
-- 6502 CPU registers, flags, stack, reset, and interrupt handling
-- NES CPU memory mirroring and controller stubs
-- a command-line ROM inspection and CPU stepping tool
+Audio/APU emulation is not implemented. Cartridge mappers other than 0 and 66,
+trainers, battery-backed save RAM, and advanced PPU edge cases are not fully
+supported.
 
-It intentionally does not yet render graphics or play audio. The next major
-milestone is a PPU implementation, followed by controller input and a frontend.
+## Run the emulator
 
-## Run
+Open a ROM in the interactive window:
+
+```text
+python nes_emulator.py path\to\game.nes --window
+```
+
+The window is resizable and keeps the NES 4:3 aspect ratio.
+
+## Inspect or step a ROM
+
+Print ROM information and execute a fixed number of CPU instructions:
 
 ```text
 python nes_emulator.py path\to\game.nes --steps 1000
 ```
 
-Render the first nametable as a 256x240 PPM image:
+## Render frames
+
+Execute frames and save the rendered output:
 
 ```text
-python nes_emulator.py path\to\game.nes --render frame.ppm
+python nes_emulator.py path\to\game.nes --frames 1 --render frame.png
 ```
 
-The renderer decodes CHR-ROM tiles, nametable tile IDs, attribute-table
-palettes, and palette RAM. Open the resulting `frame.ppm` with Paint or any
-image viewer that supports PPM.
+Use a `.ppm` extension for PPM output. Add `--dump-vram` for PPU diagnostics.
 
-Run the tests with:
+## Controls
+
+| NES button | Key |
+| --- | --- |
+| A | `Z` |
+| B | `X` |
+| Select | `A` |
+| Start | `S` |
+| Up / Down / Left / Right | Arrow keys |
+
+## Project layout
+
+- `nes_emulator.py` — command-line entry point, CPU core, and window frontend
+- `nes/rom.py` — iNES ROM loading and validation
+- `nes/bus.py` — CPU address bus, RAM, controllers, DMA, and mapper logic
+- `nes/ppu.py` — PPU registers, timing, scrolling, sprites, and rendering
+- `tests/` — unit tests for CPU, PPU, controllers, mappers, rendering, and
+  frame execution
+
+## Tests
 
 ```text
 python -m unittest discover -s tests -v
 ```
 
-Mapper 0 and mapper 66 (GxROM) are supported. Mapper 66 is used by some
-commercial cartridges and switches PRG and CHR banks through writes in the
-cartridge address range.
+The project requires Python 3 and Tkinter for the interactive window.
