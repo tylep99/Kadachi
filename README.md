@@ -20,7 +20,7 @@ controller input, and a Tkinter window frontend.
 - Interactive Tkinter display with keyboard controls
 - PNG and PPM frame output
 
-Audio/APU emulation is not implemented. Cartridge mappers other than 0 and 66,
+Basic APU audio (two pulse channels and a triangle-style channel) with PCM playback on Windows. Cartridge mappers other than 0 and 66,
 trainers, battery-backed save RAM, and advanced PPU edge cases are not fully
 supported.
 

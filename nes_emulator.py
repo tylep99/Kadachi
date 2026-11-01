@@ -9,6 +9,10 @@ import zlib
 import time
 import traceback
 import tkinter as tk
+import wave
+import io
+import queue
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -359,10 +363,12 @@ class CPU:
         """Execute instructions until approximately cycle_budget cycles elapse."""
         start = self.cycles
         end = start + cycle_budget
-        step, ppu = self.step, self.bus.ppu_device
+        step, ppu, apu = self.step, self.bus.ppu_device, self.bus.apu
         clock = ppu.clock
         while self.cycles < end:
-            clock(step() * 3)
+            elapsed = step()
+            clock(elapsed * 3)
+            apu.clock(elapsed)
             if ppu.nmi_pending:
                 ppu.nmi_pending = False
                 self.nmi()
@@ -672,6 +678,103 @@ def run_window(rom: Rom) -> None:
     cpu.reset()
     root = tk.Tk()
     root.title("NES Emulator")
+    try:
+        import winsound
+    except ImportError:
+        winsound = None
+    try:
+        import sounddevice
+    except ImportError:
+        sounddevice = None
+
+    # winsound supports either in-memory playback or asynchronous playback, but
+    # not both at once. Use one worker so in-memory clips can play synchronously
+    # without blocking Tk's frame loop.
+    audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=4)
+    audio_stop = threading.Event()
+    audio_buffer = bytearray()
+    stream_buffer = bytearray()
+    stream_lock = threading.Lock()
+    audio_stream = None
+
+    def stream_callback(outdata, frames, _time_info, _status):
+        # RawOutputStream exposes a buffer whose indexing can vary by backend;
+        # explicitly view it as bytes so 16-bit samples are never split or
+        # addressed as if they were individual frames.
+        outbytes = memoryview(outdata).cast("B")
+        wanted = frames * 2
+        with stream_lock:
+            available = min(wanted, len(stream_buffer))
+            outbytes[:available] = stream_buffer[:available]
+            del stream_buffer[:available]
+            if available < wanted:
+                outbytes[available:wanted] = b"\x00" * (wanted - available)
+
+    if sounddevice is not None:
+        try:
+            audio_stream = sounddevice.RawOutputStream(
+                samplerate=bus.apu.sample_rate,
+                channels=1,
+                dtype="int16",
+                callback=stream_callback,
+                blocksize=0,
+            )
+            audio_stream.start()
+        except Exception as error:
+            # A missing/locked output device should not prevent video input.
+            print(f"Audio output disabled: {error}", flush=True)
+            audio_stream = None
+            sounddevice = None
+
+    def audio_worker():
+        while not audio_stop.is_set():
+            pcm = audio_queue.get()
+            try:
+                if pcm is None:
+                    return
+                stream = io.BytesIO()
+                with wave.open(stream, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(bus.apu.sample_rate)
+                    wav.writeframes(pcm)
+                winsound.PlaySound(stream.getvalue(), winsound.SND_MEMORY)
+            finally:
+                audio_queue.task_done()
+
+    if winsound is not None and sounddevice is None:
+        threading.Thread(target=audio_worker, name="kadachi-audio", daemon=True).start()
+
+    def play_audio():
+        nonlocal audio_buffer
+        if winsound is None and sounddevice is None:
+            return
+        pcm = bus.apu.take_samples()
+        if not pcm:
+            return
+        audio_buffer.extend(pcm)
+        # Playing every ~16 ms frame interrupts the previous PlaySound call.
+        # Queue roughly 100 ms at a time so the async backend has a continuous
+        # clip to play.
+        chunk_size = bus.apu.sample_rate * 2 // 10
+        if len(audio_buffer) < chunk_size:
+            return
+        pcm = bytes(audio_buffer)
+        audio_buffer.clear()
+        if sounddevice is not None:
+            with stream_lock:
+                stream_buffer.extend(pcm)
+                # Keep latency bounded if emulation temporarily falls behind.
+                max_buffer = bus.apu.sample_rate * 2 // 2
+                if len(stream_buffer) > max_buffer:
+                    del stream_buffer[:-max_buffer]
+        else:
+            try:
+                audio_queue.put_nowait(pcm)
+            except queue.Full:
+                # Drop stale audio rather than allowing sound backlog to slow
+                # the emulator down after a temporary windowing or CPU stall.
+                pass
     # Keep the window freely resizable while preserving the NES frame's 4:3
     # aspect ratio. Emulation always stays at the native 256x240 resolution.
     root.resizable(True, True)
@@ -754,6 +857,7 @@ def run_window(rom: Rom) -> None:
             bus.set_controller(0, sum(keys[k] for k in pressed) | pending_buttons)
             cycle_target += cycles_per_frame
             cpu.run_cycles(max(1, int(cycle_target - cpu.cycles)))
+            play_audio()
             pending_buttons = 0
         except Exception as error:
             print(f"NES emulator stopped: {error}", flush=True)
@@ -784,6 +888,15 @@ def run_window(rom: Rom) -> None:
 
     def close_window():
         # Save the final live emulator state before the Tk window exits.
+        if winsound is not None:
+            audio_stop.set()
+            try:
+                audio_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        if audio_stream is not None:
+            audio_stream.stop()
+            audio_stream.close()
         bus.ppu_device.render_frame(rom.mirroring)
         bus.ppu_device.save_png("frame.png")
         root.destroy()

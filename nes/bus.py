@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .ppu import PPU
 from .rom import Rom
+from .apu import APU
 
 
 class Bus:
@@ -27,6 +28,7 @@ class Bus:
         self.ram = bytearray(0x800)
         self.ppu = bytearray(8)
         self.apu_io = bytearray(0x20)
+        self.apu = APU()
         self.expansion = bytearray(0x1FE0)
         self.controllers = [0, 0]
         self.controller_state = [0, 0]
@@ -50,7 +52,7 @@ class Bus:
         if address == 0x4017:
             return self._controller_read(1)
         if address < 0x4020:
-            return self.apu_io[address - 0x4000]
+            return self.apu.read(address)
         if address < 0x6000:
             return self.expansion[address - 0x4020]
         return 0
@@ -78,6 +80,7 @@ class Bus:
             self.ppu_device.oam_address = (self.ppu_device.oam_address + 0x100) & 0xff
         elif address < 0x4020:
             self.apu_io[address - 0x4000] = value
+            self.apu.write(address, value)
         elif address >= 0x8000 and self.rom and self.rom.mapper == 66:
             # Mapper 66 exposes 32 KB PRG and 8 KB CHR banks.  The cartridge
             # may contain fewer banks than the four selector bits can name.
