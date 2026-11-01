@@ -2,6 +2,10 @@
 
 Implements pulse x2 (envelope, sweep, length), triangle (linear + length),
 noise (envelope, length) and the frame counter. DMC is not implemented.
+
+Performance: the APU is advanced lazily. The CPU only calls sync() once per
+run_cycles() and the APU also syncs itself before register reads/writes, so
+samples are generated in batches whose channel parameters are constant.
 """
 from __future__ import annotations
 
@@ -18,6 +22,11 @@ DUTY = ((0, 1, 0, 0, 0, 0, 0, 0),
         (1, 0, 0, 1, 1, 1, 1, 1))
 TRIANGLE = tuple(list(range(15, -1, -1)) + list(range(16)))
 NOISE_PERIODS = (4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068)
+
+_PULSE_GAIN = 0.00752 * 40000
+_TRI_GAIN = 0.00851 * 40000
+_NOISE_GAIN = 0.00494 * 40000
+_TRI_SCALED = tuple(v * _TRI_GAIN for v in TRIANGLE)
 
 # (cpu cycle, also clocks half-frame units). Quarter-frame units clock every step.
 FRAME_STEPS = (
@@ -36,6 +45,10 @@ class APU:
         self.noise = 1
         self.sample_clock = 0.0
         self._samples: list[int] = []
+
+        # Lazy-sync support: now_fn returns the CPU's current cycle count.
+        self.now_fn = None
+        self._synced = 0
 
         # Length counters: pulse1, pulse2, triangle, noise.
         self.length = [0, 0, 0, 0]
@@ -60,11 +73,29 @@ class APU:
         self._hp_y = 0.0
 
     # ------------------------------------------------------------------
+    # Catch-up
+    # ------------------------------------------------------------------
+    def sync(self, now: int) -> None:
+        """Advance the APU to CPU cycle count `now`."""
+        delta = now - self._synced
+        if delta > 0:
+            self._synced = now
+            self._advance(delta)
+
+    def _sync_now(self) -> None:
+        if self.now_fn is not None:
+            self.sync(self.now_fn())
+
+    def clock(self, cpu_cycles: int) -> None:
+        """Advance by a cycle count directly. Don't mix with sync()/now_fn."""
+        self._advance(cpu_cycles)
+
+    # ------------------------------------------------------------------
     # Registers
     # ------------------------------------------------------------------
     def read(self, address: int) -> int:
         if address == 0x4015:
-            # Bits 0-3 report whether each length counter is non-zero.
+            self._sync_now()
             return sum((1 << i) for i in range(4) if self.length[i] > 0)
         return self.registers[address - 0x4000] if 0x4000 <= address < 0x4018 else 0
 
@@ -72,6 +103,7 @@ class APU:
         value &= 0xFF
         if not 0x4000 <= address <= 0x4017:
             return
+        self._sync_now()  # settle everything before this register changes
         self.registers[address - 0x4000] = value
         if address == 0x4015:
             self.enabled = [bool(value & (1 << i)) for i in range(5)]
@@ -109,10 +141,20 @@ class APU:
     # ------------------------------------------------------------------
     # Frame counter and its units
     # ------------------------------------------------------------------
-    def _clock_frame(self) -> None:
-        steps = FRAME_STEPS[self.five_step]
-        while self.frame_cycles >= steps[self.frame_index][0]:
-            half = steps[self.frame_index][1]
+    def _advance(self, cycles: int) -> None:
+        """Run `cycles` CPU cycles, splitting at frame-counter steps."""
+        while cycles > 0:
+            steps = FRAME_STEPS[self.five_step]
+            at, half = steps[self.frame_index]
+            until = at - self.frame_cycles
+            if until > cycles:
+                self.frame_cycles += cycles
+                self._generate(cycles)
+                return
+            if until > 0:
+                self._generate(until)
+                cycles -= until
+            self.frame_cycles = at
             self._quarter()
             if half:
                 self._half()
@@ -176,58 +218,103 @@ class APU:
         return reg & 15 if reg & 0x10 else self.decay[ch]
 
     # ------------------------------------------------------------------
-    # Sample generation
+    # Sample generation (batched; all channel state is constant per batch)
     # ------------------------------------------------------------------
-    def clock(self, cpu_cycles: int) -> None:
-        self.frame_cycles += cpu_cycles
-        self._clock_frame()
-        self.sample_clock += cpu_cycles * self.sample_rate / CPU_HZ
-        count = int(self.sample_clock)
-        self.sample_clock -= count
-        for _ in range(count):
-            self._samples.append(self._mix_sample())
+    def _generate(self, cycles: int) -> None:
+        self.sample_clock += cycles * self.sample_rate / CPU_HZ
+        n = int(self.sample_clock)
+        if n:
+            self.sample_clock -= n
+            self._render(n)
 
     def take_samples(self) -> bytes:
+        self._sync_now()
         values = array.array("h", self._samples)
         self._samples.clear()
         return values.tobytes()
 
-    def _mix_sample(self) -> int:
-        regs, rate = self.registers, self.sample_rate
+    def _render(self, n: int) -> None:
+        regs, rate, length = self.registers, self.sample_rate, self.length
+        mix = None  # allocated only if some channel is audible
 
-        pulse = 0
+        # Pulse channels.
         for ch in (0, 1):
-            if not self.length[ch]:
+            if not length[ch]:
                 continue
             timer = self.timer[ch]
             if timer < 8 or self._sweep_target(ch) > 0x7FF:
                 continue
-            phase = (self.phase[ch] + CPU_HZ / (16 * (timer + 1)) / rate) % 1.0
+            vol = self._volume(ch)
+            if not vol:
+                continue
+            if mix is None:
+                mix = [0.0] * n
+            inc = CPU_HZ / (16 * (timer + 1)) / rate
+            duty = DUTY[regs[ch * 4] >> 6]
+            amp = vol * _PULSE_GAIN
+            phase = self.phase[ch]
+            for i in range(n):
+                phase += inc
+                if phase >= 1.0:
+                    phase -= 1.0
+                if duty[int(phase * 8)]:
+                    mix[i] += amp
             self.phase[ch] = phase
-            if DUTY[regs[ch * 4] >> 6][int(phase * 8)]:
-                pulse += self._volume(ch)
 
-        if self.length[2] and self.linear:
+        # Triangle: when halted or ultrasonic, hold the last output level.
+        const = self.tri_out * _TRI_GAIN
+        if length[2] and self.linear:
             timer = regs[10] | ((regs[11] & 7) << 8)
-            if timer >= 2:  # very high periods are ultrasonic; hold the last value
-                phase = (self.phase[2] + CPU_HZ / (32 * (timer + 1)) / rate) % 1.0
+            if timer >= 2:
+                if mix is None:
+                    mix = [0.0] * n
+                inc = CPU_HZ / (32 * (timer + 1)) / rate
+                tri = _TRI_SCALED
+                phase = self.phase[2]
+                for i in range(n):
+                    phase += inc
+                    if phase >= 1.0:
+                        phase -= 1.0
+                    mix[i] += tri[int(phase * 32)]
                 self.phase[2] = phase
                 self.tri_out = TRIANGLE[int(phase * 32)]
+                const = 0.0
 
-        noise = 0
-        if self.length[3]:
-            self.noise_phase += CPU_HZ / NOISE_PERIODS[regs[14] & 15] / rate
-            steps = int(self.noise_phase)
-            self.noise_phase -= steps
-            tap = 6 if regs[14] & 0x80 else 1
-            n = self.noise
-            for _ in range(steps):
-                n = (n >> 1) | (((n ^ (n >> tap)) & 1) << 14)
-            self.noise = n
-            if not n & 1:
-                noise = self._volume(3)
+        # Noise.
+        if length[3]:
+            vol = self._volume(3)
+            if vol:
+                if mix is None:
+                    mix = [0.0] * n
+                inc = CPU_HZ / NOISE_PERIODS[regs[14] & 15] / rate
+                tap = 6 if regs[14] & 0x80 else 1
+                amp = vol * _NOISE_GAIN
+                acc, lfsr = self.noise_phase, self.noise
+                for i in range(n):
+                    acc += inc
+                    s = int(acc)
+                    if s:
+                        acc -= s
+                        for _ in range(s):
+                            lfsr = (lfsr >> 1) | (((lfsr ^ (lfsr >> tap)) & 1) << 14)
+                    if not lfsr & 1:
+                        mix[i] += amp
+                self.noise_phase, self.noise = acc, lfsr
 
-        x = (0.00752 * pulse + 0.00851 * self.tri_out + 0.00494 * noise) * 40000
-        y = x - self._hp_x + 0.995 * self._hp_y
-        self._hp_x, self._hp_y = x, y
-        return max(-32767, min(32767, int(y)))
+        # Fully silent fast path.
+        if mix is None and const == 0.0 and self._hp_x == 0.0 and abs(self._hp_y) < 1.0:
+            self._hp_y = 0.0
+            self._samples.extend([0] * n)
+            return
+
+        if mix is None:
+            mix = [0.0] * n
+        out = self._samples
+        px, py = self._hp_x, self._hp_y
+        for i in range(n):
+            x = mix[i] + const
+            py = x - px + 0.995 * py   # DC-blocking high-pass
+            px = x
+            v = int(py)
+            out.append(32767 if v > 32767 else -32767 if v < -32767 else v)
+        self._hp_x, self._hp_y = px, py

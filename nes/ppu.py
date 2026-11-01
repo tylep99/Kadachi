@@ -91,6 +91,9 @@ class PPU:
 
     def clock(self, dots: int) -> None:
         self.dot += dots
+        # NEW fast path: no scanline boundary and no sprite-0 hit pending.
+        if self.dot < 341 and (self.sprite_zero_hit_at is None or self.sprite_zero_hit):
+            return
         while True:
             hit_at = self.sprite_zero_hit_at
             if (hit_at is not None and not self.sprite_zero_hit
