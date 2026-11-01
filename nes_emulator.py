@@ -360,23 +360,23 @@ class CPU:
         self.p = (self.p & ~(self.C | self.V)) | (self.C if result >= 0 else 0) | (self.V if ((self.a ^ wrapped) & (self.a ^ value) & 0x80) else 0)
         self.a = self.set_nz(wrapped)
 
-        def run_cycles(self, cycle_budget: int) -> int:
-            """Execute instructions until approximately cycle_budget cycles elapse."""
-            start = self.cycles
-            end = start + cycle_budget
-            ppu, apu = self.bus.ppu_device, self.bus.apu
-            clock, read, table = ppu.clock, self._read, self._table
-            while self.cycles < end:
-                pc = self.pc
-                self.pc = (pc + 1) & 0xFFFF
-                elapsed = table[read(pc)]()
-                self.cycles += elapsed
-                clock(elapsed * 3)
-                if ppu.nmi_pending:
-                    ppu.nmi_pending = False
-                    self.nmi()
-            apu.sync(self.cycles)   # APU catches up once per run
-            return self.cycles - start
+    def run_cycles(self, cycle_budget: int) -> int:
+        """Execute instructions until approximately cycle_budget cycles elapse."""
+        start = self.cycles
+        end = start + cycle_budget
+        ppu, apu = self.bus.ppu_device, self.bus.apu
+        clock, read, table = ppu.clock, self._read, self._table
+        while self.cycles < end:
+            pc = self.pc
+            self.pc = (pc + 1) & 0xFFFF
+            elapsed = table[read(pc)]()
+            self.cycles += elapsed
+            clock(elapsed * 3)
+            if ppu.nmi_pending:
+                ppu.nmi_pending = False
+                self.nmi()
+        apu.sync(self.cycles)   # APU catches up once per run
+        return self.cycles - start
 
     # ------------------------------------------------------------------
     # Table-driven instruction dispatch (one closure per opcode).
