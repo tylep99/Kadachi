@@ -687,28 +687,35 @@ def run_window(rom: Rom) -> None:
     except ImportError:
         sounddevice = None
 
-    # winsound supports either in-memory playback or asynchronous playback, but
-    # not both at once. Use one worker so in-memory clips can play synchronously
-    # without blocking Tk's frame loop.
     audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=4)
     audio_stop = threading.Event()
     audio_buffer = bytearray()
     stream_buffer = bytearray()
     stream_lock = threading.Lock()
     audio_stream = None
+    # CHANGED: cushion before playback starts / resumes after an underrun.
+    prefill_bytes = bus.apu.sample_rate * 2 // 10   # ~100 ms
+    max_stream_bytes = bus.apu.sample_rate * 2 // 4  # ~250 ms latency cap
+    primed = [False]
 
     def stream_callback(outdata, frames, _time_info, _status):
-        # RawOutputStream exposes a buffer whose indexing can vary by backend;
-        # explicitly view it as bytes so 16-bit samples are never split or
-        # addressed as if they were individual frames.
         outbytes = memoryview(outdata).cast("B")
         wanted = frames * 2
         with stream_lock:
+            # CHANGED: stay silent until enough audio is buffered, and go
+            # back to waiting after an underrun instead of stuttering.
+            if not primed[0]:
+                if len(stream_buffer) >= prefill_bytes:
+                    primed[0] = True
+                else:
+                    outbytes[:wanted] = b"\x00" * wanted
+                    return
             available = min(wanted, len(stream_buffer))
             outbytes[:available] = stream_buffer[:available]
             del stream_buffer[:available]
             if available < wanted:
                 outbytes[available:wanted] = b"\x00" * (wanted - available)
+                primed[0] = False
 
     if sounddevice is not None:
         try:
@@ -718,10 +725,10 @@ def run_window(rom: Rom) -> None:
                 dtype="int16",
                 callback=stream_callback,
                 blocksize=0,
+                latency="high",  # CHANGED
             )
             audio_stream.start()
         except Exception as error:
-            # A missing/locked output device should not prevent video input.
             print(f"Audio output disabled: {error}", flush=True)
             audio_stream = None
             sounddevice = None
@@ -752,31 +759,25 @@ def run_window(rom: Rom) -> None:
         pcm = bus.apu.take_samples()
         if not pcm:
             return
+        # CHANGED: sounddevice path pushes every frame, no 100 ms batching.
+        if sounddevice is not None:
+            with stream_lock:
+                stream_buffer.extend(pcm)
+                if len(stream_buffer) > max_stream_bytes:
+                    del stream_buffer[:-max_stream_bytes]
+            return
+        # winsound fallback: still needs ~100 ms clips.
         audio_buffer.extend(pcm)
-        # Playing every ~16 ms frame interrupts the previous PlaySound call.
-        # Queue roughly 100 ms at a time so the async backend has a continuous
-        # clip to play.
         chunk_size = bus.apu.sample_rate * 2 // 10
         if len(audio_buffer) < chunk_size:
             return
         pcm = bytes(audio_buffer)
         audio_buffer.clear()
-        if sounddevice is not None:
-            with stream_lock:
-                stream_buffer.extend(pcm)
-                # Keep latency bounded if emulation temporarily falls behind.
-                max_buffer = bus.apu.sample_rate * 2 // 2
-                if len(stream_buffer) > max_buffer:
-                    del stream_buffer[:-max_buffer]
-        else:
-            try:
-                audio_queue.put_nowait(pcm)
-            except queue.Full:
-                # Drop stale audio rather than allowing sound backlog to slow
-                # the emulator down after a temporary windowing or CPU stall.
-                pass
-    # Keep the window freely resizable while preserving the NES frame's 4:3
-    # aspect ratio. Emulation always stays at the native 256x240 resolution.
+        try:
+            audio_queue.put_nowait(pcm)
+        except queue.Full:
+            pass
+
     root.resizable(True, True)
     root.minsize(256, 240)
     root.geometry("512x480")
@@ -787,8 +788,6 @@ def run_window(rom: Rom) -> None:
 
     def scale_image():
         nonlocal display_image
-        # Tk's built-in scaling keeps this dependency-free and avoids
-        # distorting the picture when the window is resized.
         scale = max(1, min(root.winfo_width() // 256, root.winfo_height() // 240))
         if scale == 1:
             display_image = source_image
@@ -798,7 +797,6 @@ def run_window(rom: Rom) -> None:
 
     root.bind("<Configure>", lambda _event: scale_image())
 
-    # NES controller order: A, B, Select, Start, Up, Down, Left, Right.
     keys = {
         "z": 0x01, "x": 0x02, "a": 0x01, "b": 0x02,
         "Shift_L": 0x04, "Shift_R": 0x04,
@@ -809,8 +807,6 @@ def run_window(rom: Rom) -> None:
     pending_buttons = 0
 
     def key_name(event):
-        # Windows Tk reports Enter as Return on most layouts, but some report
-        # a numeric keycode or keypad name instead.
         if event.keysym in keys:
             return event.keysym
         if getattr(event, "keycode", 0) in (13, 36, 108):
@@ -837,23 +833,33 @@ def run_window(rom: Rom) -> None:
     root.bind("<KeyRelease>", key_up)
     label.bind("<Button-1>", lambda _event: root.focus_force())
     root.focus_force()
-    root.focus_force()
 
-    # NTSC timing, as in Mesen: 1,789,773 Hz CPU / 29,780.5 cycles per frame
-    # = ~60.0988 fps. Fractional cycles are carried so long-run speed is exact.
     cycles_per_frame = NTSC_CPU_HZ / NTSC_FPS
     frame_time = 1 / NTSC_FPS
     cycle_target = float(cpu.cycles)
     deadline = time.perf_counter()
     skipped = 0
 
+    # CHANGED: diagnostics. Set DEBUG_AUDIO = False once audio works.
+    DEBUG_AUDIO = True
+    fps_stats = {"frames": 0, "t": time.perf_counter()}
+
     def draw_frame():
         nonlocal pending_buttons, deadline, skipped, cycle_target
-        # NTSC NES CPU timing is approximately 29,780 cycles per frame.
+        # CHANGED: once-a-second FPS / audio status line.
+        if DEBUG_AUDIO:
+            fps_stats["frames"] += 1
+            t = time.perf_counter()
+            if t - fps_stats["t"] >= 1.0:
+                backend = "sounddevice" if sounddevice else "winsound" if winsound else "none"
+                apu = bus.apu
+                print(f"FPS: {fps_stats['frames'] / (t - fps_stats['t']):.1f} | "
+                      f"audio buffer: {len(stream_buffer)} bytes | backend: {backend} | "
+                      f"enabled: {apu.enabled[:4]} | length: {apu.length}", flush=True)
+                fps_stats["frames"] = 0
+                fps_stats["t"] = t
         try:
             bus.ppu_device.begin_frame()
-            # Preserve a short key press for this entire emulated frame. Real NES
-            # controllers are sampled by the game, not by the host window events.
             bus.set_controller(0, sum(keys[k] for k in pressed) | pending_buttons)
             cycle_target += cycles_per_frame
             cpu.run_cycles(max(1, int(cycle_target - cpu.cycles)))
@@ -866,15 +872,12 @@ def run_window(rom: Rom) -> None:
             return
         ppu = bus.ppu_device
         deadline += frame_time
-        # If emulation has fallen more than a frame behind, skip drawing (at most
-        # four frames in a row) so the game keeps running at full speed.
         if time.perf_counter() > deadline + frame_time and skipped < 4:
             skipped += 1
         else:
             skipped = 0
             ppu.render_frame(rom.mirroring)
             try:
-                # Hand Tk the PNG from memory instead of round-tripping via disk.
                 source_image.configure(data=base64.b64encode(ppu.png_bytes()))
                 scale_image()
             except tk.TclError:
@@ -882,12 +885,11 @@ def run_window(rom: Rom) -> None:
                 source_image.configure(file="frame.png")
                 scale_image()
         now = time.perf_counter()
-        if deadline < now - 0.25:  # resync after a long stall (window drag, etc.)
+        if deadline < now - 0.25:
             deadline = now
         root.after(max(1, int((deadline - now) * 1000)), draw_frame)
 
     def close_window():
-        # Save the final live emulator state before the Tk window exits.
         if winsound is not None:
             audio_stop.set()
             try:
