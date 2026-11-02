@@ -700,29 +700,28 @@ def run_window(rom: Rom) -> None:
     stream_buffer = bytearray()
     stream_lock = threading.Lock()
     audio_stream = None
-    # CHANGED: cushion before playback starts / resumes after an underrun.
-    prefill_bytes = bus.apu.sample_rate * 2 // 10   # ~100 ms
-    max_stream_bytes = bus.apu.sample_rate * 2 // 4  # ~250 ms latency cap
+    # Fixed callback size so the first fill is always enough to start, and a
+    # short underrun pads silence instead of dropping back to a mute wait.
+    block_frames = 512
+    prefill_bytes = block_frames * 2 * 3
+    max_stream_bytes = bus.apu.sample_rate * 2 // 5
     primed = [False]
 
     def stream_callback(outdata, frames, _time_info, _status):
         outbytes = memoryview(outdata).cast("B")
         wanted = frames * 2
         with stream_lock:
-            # CHANGED: stay silent until enough audio is buffered, and go
-            # back to waiting after an underrun instead of stuttering.
             if not primed[0]:
-                if len(stream_buffer) >= prefill_bytes:
-                    primed[0] = True
-                else:
+                if len(stream_buffer) < prefill_bytes:
                     outbytes[:wanted] = b"\x00" * wanted
                     return
+                primed[0] = True
             available = min(wanted, len(stream_buffer))
-            outbytes[:available] = stream_buffer[:available]
-            del stream_buffer[:available]
+            if available:
+                outbytes[:available] = stream_buffer[:available]
+                del stream_buffer[:available]
             if available < wanted:
                 outbytes[available:wanted] = b"\x00" * (wanted - available)
-                primed[0] = False
 
     if sounddevice is not None:
         try:
@@ -731,8 +730,7 @@ def run_window(rom: Rom) -> None:
                 channels=1,
                 dtype="int16",
                 callback=stream_callback,
-                blocksize=0,
-                latency="high",  # CHANGED
+                blocksize=block_frames,
             )
             audio_stream.start()
         except Exception as error:
@@ -766,7 +764,6 @@ def run_window(rom: Rom) -> None:
         pcm = bus.apu.take_samples()
         if not pcm:
             return
-        # CHANGED: sounddevice path pushes every frame, no 100 ms batching.
         if sounddevice is not None:
             with stream_lock:
                 stream_buffer.extend(pcm)
@@ -968,14 +965,20 @@ def run_window(rom: Rom) -> None:
     cycle_target = float(cpu.cycles)
     deadline = time.perf_counter()
     skipped = 0
+    run_started = time.perf_counter()
+    frames_rendered = 0
+    frames_skipped = 0
+    emulation_cycles = 0
 
     def draw_frame():
         nonlocal pending_buttons, deadline, skipped, cycle_target
+        nonlocal frames_rendered, frames_skipped, emulation_cycles
         try:
             bus.ppu_device.begin_frame()
             bus.set_controller(0, sum(keys[k] for k in pressed) | pending_buttons)
             cycle_target += cycles_per_frame
-            cpu.run_cycles(max(1, int(cycle_target - cpu.cycles)))
+            executed_cycles = cpu.run_cycles(max(1, int(cycle_target - cpu.cycles)))
+            emulation_cycles += executed_cycles
             play_audio()
             pending_buttons = 0
         except Exception as error:
@@ -987,8 +990,10 @@ def run_window(rom: Rom) -> None:
         deadline += frame_time
         if time.perf_counter() > deadline + frame_time and skipped < 4:
             skipped += 1
+            frames_skipped += 1
         else:
             skipped = 0
+            frames_rendered += 1
             ppu.render_frame(rom.mirroring)
             try:
                 source_image.configure(data=base64.b64encode(ppu.png_bytes()))
@@ -1014,6 +1019,23 @@ def run_window(rom: Rom) -> None:
             audio_stream.close()
         bus.ppu_device.render_frame(rom.mirroring)
         bus.ppu_device.save_png("frame.png")
+        elapsed = max(0.001, time.perf_counter() - run_started)
+        average_fps = frames_rendered / elapsed
+        emulation_speed = (emulation_cycles / NTSC_CPU_HZ) / elapsed * 100
+        log_path = Path("kadachi_performance.log")
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"Run ended: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"ROM: {Path(rom.path).name if hasattr(rom, 'path') else 'loaded cartridge'}\n"
+                f"Runtime: {elapsed:.2f} seconds\n"
+                f"Frames rendered: {frames_rendered}\n"
+                f"Frames skipped: {frames_skipped}\n"
+                f"Average FPS: {average_fps:.2f}\n"
+                f"Emulated CPU cycles: {emulation_cycles:,}\n"
+                f"Emulation speed: {emulation_speed:.1f}%\n"
+                f"Audio backend: {'sounddevice' if sounddevice else 'winsound' if winsound else 'none'}\n"
+                "-" * 40 + "\n\n"
+            )
         root.destroy()
 
     draw_frame()
