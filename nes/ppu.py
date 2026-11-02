@@ -41,10 +41,22 @@ class PPU:
 
     @chr_rom.setter
     def chr_rom(self, value: bytes) -> None:
-        self._chr_rom = value
-        self._tile_cache: dict[int, tuple] = {}
+        if value is self.__dict__.get("_chr_rom"):
+            return  # same bank object: nothing changed, keep decoded tiles
+        self._select_chr(value)
         if hasattr(self, "_chr_events"):
             self._chr_events.append((self.scanline, value))
+
+    def _select_chr(self, value: bytes) -> None:
+        """Make `value` the active CHR bank, reusing its decoded-tile cache."""
+        self._chr_rom = value
+        caches = self.__dict__.setdefault("_tile_caches", {})
+        entry = caches.get(id(value))
+        if entry is None or entry[0] is not value:
+            if len(caches) >= 8:  # bound memory if a mapper hands out many banks
+                caches.clear()
+            entry = caches[id(value)] = (value, {})
+        self._tile_cache = entry[1]
 
     def _tile_rows(self, address: int) -> tuple:
         """Eight decoded pixel rows for the tile whose pattern data starts at address."""
@@ -73,6 +85,7 @@ class PPU:
         self._chr_frame_origin = 0
         self._last_chr_events: list[tuple[int, bytes]] = []
         self._chr_events: list[tuple[int, bytes]] = [(0, self._chr_rom)]
+        self._render_chr_events = self._chr_events
         self.nmi_pending = False
         self.sprite_zero_hit = False
         self.sprite_zero_hit_at: tuple[int, int] | None = None
@@ -277,8 +290,7 @@ class PPU:
         # Rendering temporarily walks historical CHR banks; restore the bank
         # active at the end of the frame for the next frame's initial state.
         if self._chr_events and self._chr_rom is not self._chr_events[-1][1]:
-            self._chr_rom = self._chr_events[-1][1]
-            self._tile_cache = {}
+            self._select_chr(self._chr_events[-1][1])
 
     def _draw_background(self, scroll_x: int, scroll_y: int, base_nt: int, y_start: int, y_end: int) -> None:
         """Draw background scanlines [y_start, y_end) using one scroll/nametable state."""
@@ -297,6 +309,12 @@ class PPU:
             tables.append(bytes(table))
         read_vram, tile_rows, frame = self._read_vram, self._tile_rows, self.frame
         crop_start = 8 + fine_x
+        events = self._render_chr_events
+        # Common case: one CHR bank for the whole frame -> choose it once.
+        single = len(events) == 1 and events[0][0] <= 0
+        if single and events[0][1] is not self._chr_rom:
+            self._select_chr(events[0][1])
+        translated: dict[int, dict] = {}   # per CHR bank: (address, palette_id) -> 8 coloured rows
         for screen_tile_y in range(-1, 31):
             top = screen_tile_y * 8 - fine_y
             if top + 8 <= y_start or top >= y_end:
@@ -304,30 +322,40 @@ class PPU:
             tile_y = first_y + screen_tile_y
             nt_y = (base_nt_y + tile_y // 30) & 1
             row_in_table = tile_y % 30
+            attr_row = 0x3C0 + (row_in_table // 4) * 8
+            attr_shift_y = ((row_in_table % 4) // 2) * 2
+            cells = []
             for screen_tile_x in range(-1, 33):
                 tile_x = first_x + screen_tile_x
                 table_base = 0x2000 + (nt_y * 2 + ((base_nt_x + tile_x // 32) & 1)) * 0x400
                 column = tile_x % 32
                 tile = read_vram(table_base + row_in_table * 32 + column)
-                attribute = read_vram(table_base + 0x3C0 + (row_in_table // 4) * 8 + column // 4)
-                palette_id = (attribute >> ((((row_in_table % 4) // 2) * 2 + ((column % 4) // 2)) * 2)) & 3
-                # Keep the tile metadata alongside the tile coordinates; the
-                # active CHR bank can change between scanlines.
-                if screen_tile_x == -1:
-                    row_cells = []
-                row_cells.append((pattern_base + tile * 16, tables[palette_id]))
+                attribute = read_vram(table_base + attr_row + column // 4)
+                palette_id = (attribute >> ((attr_shift_y + ((column % 4) // 2)) * 2)) & 3
+                cells.append((pattern_base + tile * 16, palette_id))
+            row_rows = None   # decoded+coloured rows for this tile row's CHR bank
             for row in range(8):
                 sy = top + row
                 if sy < y_start or sy >= y_end:
                     continue
-                for event_line, event_chr in reversed(self._render_chr_events):
-                    if event_line <= sy:
-                        if event_chr is not self._chr_rom:
-                            self._chr_rom = event_chr
-                            self._tile_cache = {}
-                        break
-                row_cells_for_line = [(tile_rows(address), table) for address, table in row_cells]
-                line = b"".join([rows[row].translate(table) for rows, table in row_cells_for_line])
+                if not single:
+                    for event_line, event_chr in reversed(events):
+                        if event_line <= sy:
+                            if event_chr is not self._chr_rom:
+                                self._select_chr(event_chr)
+                                row_rows = None
+                            break
+                if row_rows is None:
+                    cache = translated.setdefault(id(self._chr_rom), {})
+                    row_rows = []
+                    for address, palette_id in cells:
+                        key = (address << 2) | palette_id
+                        rows = cache.get(key)
+                        if rows is None:
+                            table = tables[palette_id]
+                            rows = cache[key] = tuple([r.translate(table) for r in tile_rows(address)])
+                        row_rows.append(rows)
+                line = b"".join([rows[row] for rows in row_rows])
                 frame[sy * 256:(sy + 1) * 256] = line[crop_start:crop_start + 256]
 
     def _base_nametable(self) -> int:
@@ -345,6 +373,10 @@ class PPU:
         height = 16 if tall else 8
         pattern_8x8 = 0x1000 if self.control & 0x08 else 0
         universal = palette[0]
+        events = self._render_chr_events
+        single = len(events) == 1 and events[0][0] <= 0
+        if single and events[0][1] is not self._chr_rom:
+            self._select_chr(events[0][1])
         for sprite in range(63, -1, -1):
             base = sprite * 4
             y = oam[base]
@@ -357,12 +389,12 @@ class PPU:
                 screen_y = y + 1 + row
                 if screen_y >= 240:
                     break
-                for event_line, event_chr in reversed(self._render_chr_events):
-                    if event_line <= screen_y:
-                        if event_chr is not self._chr_rom:
-                            self._chr_rom = event_chr
-                            self._tile_cache = {}
-                        break
+                if not single:
+                    for event_line, event_chr in reversed(events):
+                        if event_line <= screen_y:
+                            if event_chr is not self._chr_rom:
+                                self._select_chr(event_chr)
+                            break
                 source_row = (height - 1 - row) if flip_v else row
                 if tall:
                     address = ((tile & 1) * 0x1000) + (tile & 0xFE) * 16 + (source_row // 8) * 16

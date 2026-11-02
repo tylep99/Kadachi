@@ -18,13 +18,14 @@ class Bus:
         if rom:
             # Mapper 66 selects one 8 KB CHR window, including at power-on.
             self.ppu_device.chr_rom = (
-                rom.chr_rom[:0x2000] if rom.mapper == 66 else rom.chr_rom
+                self._chr_bank_slice(0) if rom.mapper == 66 else rom.chr_rom
             )
             self.ppu_device.mirroring = rom.mirroring
         self.prg_bank = 0
         self.chr_bank = 0
         self._prg_bank_count = max(1, len(rom.prg_rom) // 0x8000) if rom else 1
         self._chr_bank_count = max(1, len(rom.chr_rom) // 0x2000) if rom else 1
+        self._rebuild_prg_windows()
         self.ram = bytearray(0x800)
         self.ppu = bytearray(8)
         self.apu_io = bytearray(0x20)
@@ -34,15 +35,36 @@ class Bus:
         self.controller_state = [0, 0]
         self.controller_strobe = 0
 
+    def _rebuild_prg_windows(self) -> None:
+        """Flat 32 KB views of each PRG bank, so $8000-$FFFF reads are one index.
+        A 16 KB image is mirrored; `prg_window` is the bank selected by prg_bank."""
+        prg = self._prg
+        if prg is None:
+            self._prg_windows, self._prg_window = [], None
+            return
+        if len(prg) == 0x4000:
+            windows = [prg + prg]
+        else:
+            windows = [prg[i * 0x8000:(i + 1) * 0x8000] for i in range(self._prg_bank_count)]
+        self._prg_windows = windows
+        self._prg_window = windows[self.prg_bank % self._prg_bank_count]
+
+    # Derived views are rebuilt on load rather than stored in save states.
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_prg_windows", None)
+        state.pop("_prg_window", None)
+        return state
+
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+        self._rebuild_prg_windows()
+
     def read(self, address: int) -> int:
         address &= 0xFFFF
         if address >= 0x8000:
-            prg = self._prg
-            if prg is None:
-                return 0
-            # prg_bank is always 0 except on mapper 66 (GxROM, 32 KB banks).
-            bank = self.prg_bank % self._prg_bank_count
-            return prg[(bank << 15) + (address & self._prg_mask)]
+            window = self._prg_window
+            return 0 if window is None else window[address & 0x7FFF]
         if address < 0x2000:
             return self.ram[address & 0x7FF]
         if address < 0x4000:
@@ -85,11 +107,20 @@ class Bus:
             # Mapper 66 exposes 32 KB PRG and 8 KB CHR banks.  The cartridge
             # may contain fewer banks than the four selector bits can name.
             self.prg_bank = ((value >> 4) & 0x03) % self._prg_bank_count
+            self._prg_window = self._prg_windows[self.prg_bank]
             self.chr_bank = (value & 0x03) % self._chr_bank_count
-            start = self.chr_bank * 0x2000
-            end = start + 0x2000
-            if end <= len(self.rom.chr_rom):
-                self.ppu_device.chr_rom = self.rom.chr_rom[start:end]
+            bank = self._chr_bank_slice(self.chr_bank)
+            if bank is not None:
+                self.ppu_device.chr_rom = bank
+
+    def _chr_bank_slice(self, index: int):
+        """8 KB CHR bank `index` as a stable object (sliced once, so the PPU's
+        decoded-tile cache survives bank switches). None if out of range."""
+        banks = self.__dict__.get("_chr_banks")  # absent in old save states
+        if banks is None:
+            data = self.rom.chr_rom
+            banks = self._chr_banks = [data[i:i + 0x2000] for i in range(0, len(data) - 0x1FFF, 0x2000)]
+        return banks[index] if index < len(banks) else None
 
     def set_controller(self, player: int, buttons: int) -> None:
         """Set an NES controller bitfield: A,B,Select,Start,Up,Down,Left,Right."""

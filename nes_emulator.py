@@ -368,12 +368,26 @@ class CPU:
         end = start + cycle_budget
         ppu, apu = self.bus.ppu_device, self.bus.apu
         clock, read, table = ppu.clock, self._read, self._table
+        bus = self.bus
         while self.cycles < end:
             pc = self.pc
             self.pc = (pc + 1) & 0xFFFF
-            elapsed = table[read(pc)]()
+            # Opcode fetch straight from the mapped PRG window (skips bus.read).
+            window = bus._prg_window
+            elapsed = table[window[pc & 0x7FFF] if pc >= 0x8000 and window is not None else read(pc)]()
             self.cycles += elapsed
-            clock(elapsed * 3)
+            # PPU.clock does nothing but `dot += n` unless a scanline ends or the
+            # pending sprite-0 hit (scanline, dot) is reached, so skip the call then.
+            dots = ppu.dot + elapsed * 3
+            if dots < 341:
+                hit_at = ppu.sprite_zero_hit_at
+                if (hit_at is None or ppu.sprite_zero_hit or ppu.scanline < hit_at[0]
+                        or (ppu.scanline == hit_at[0] and dots < hit_at[1])):
+                    ppu.dot = dots
+                else:
+                    clock(elapsed * 3)
+            else:
+                clock(elapsed * 3)
             if ppu.nmi_pending:
                 ppu.nmi_pending = False
                 self.nmi()
