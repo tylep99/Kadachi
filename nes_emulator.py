@@ -812,9 +812,12 @@ def run_window(rom: Rom) -> None:
              font=("Segoe UI", 18, "bold")).pack(side="left", padx=(24, 8))
     tk.Label(header, text="NES EMULATOR", bg=palette["panel"], fg=palette["muted"],
              font=("Segoe UI", 10, "bold")).pack(side="left", pady=(5, 0))
+    fps_label = tk.Label(header, text="-- FPS", bg=palette["panel"], fg=palette["muted"],
+                         font=("Segoe UI", 9, "bold"))
+    fps_label.pack(side="right", padx=(0, 24))
     status = tk.Label(header, text="●  RUNNING", bg=palette["panel"], fg=palette["green"],
                      font=("Segoe UI", 9, "bold"))
-    status.pack(side="right", padx=24)
+    status.pack(side="right", padx=8)
 
     body = tk.Frame(root, bg=palette["bg"])
     body.pack(fill="both", expand=True)
@@ -983,10 +986,13 @@ def run_window(rom: Rom) -> None:
     frames_rendered = 0
     frames_skipped = 0
     emulation_cycles = 0
+    fps_sample_started = run_started
+    fps_sample_frames = 0
 
     def draw_frame():
         nonlocal pending_buttons, deadline, skipped, cycle_target
         nonlocal frames_rendered, frames_skipped, emulation_cycles
+        nonlocal fps_sample_started, fps_sample_frames
         try:
             bus.ppu_device.begin_frame()
             bus.set_controller(0, sum(keys[k] for k in pressed) | pending_buttons)
@@ -1008,6 +1014,7 @@ def run_window(rom: Rom) -> None:
         else:
             skipped = 0
             frames_rendered += 1
+            fps_sample_frames += 1
             ppu.render_frame(rom.mirroring)
             try:
                 source_image.configure(data=base64.b64encode(ppu.png_bytes()))
@@ -1017,6 +1024,12 @@ def run_window(rom: Rom) -> None:
                 source_image.configure(file="frame.png")
                 scale_image()
         now = time.perf_counter()
+        fps_sample_elapsed = now - fps_sample_started
+        if fps_sample_elapsed >= 0.5:
+            measured_fps = fps_sample_frames / fps_sample_elapsed
+            fps_label.configure(text=f"{measured_fps:.1f} FPS")
+            fps_sample_started = now
+            fps_sample_frames = 0
         if deadline < now - 0.25:
             deadline = now
         root.after(max(1, int((deadline - now) * 1000)), draw_frame)
