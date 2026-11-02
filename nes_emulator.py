@@ -9,6 +9,8 @@ import zlib
 import time
 import traceback
 import tkinter as tk
+from tkinter import filedialog, messagebox
+import pickle
 import wave
 import io
 import queue
@@ -681,7 +683,8 @@ def run_window(rom: Rom) -> None:
     cpu = CPU(bus)
     cpu.reset()
     root = tk.Tk()
-    root.title("NES Emulator")
+    root.title("KADACHI  /  NES EMULATOR")
+    root.configure(bg="#111318")
     try:
         import winsound
     except ImportError:
@@ -783,12 +786,111 @@ def run_window(rom: Rom) -> None:
             pass
 
     root.resizable(True, True)
-    root.minsize(256, 240)
-    root.geometry("512x480")
+    root.minsize(760, 560)
+    root.geometry("1080x700")
+
+    # Application chrome is intentionally kept in Tk so the emulator remains
+    # dependency-free and the game canvas can still scale cleanly.
+    palette = {"bg": "#111318", "panel": "#1a1d24", "panel2": "#222631",
+               "line": "#303644", "text": "#edf0f5", "muted": "#8e97a8",
+               "accent": "#ffb84d", "green": "#6fe0aa"}
+    header = tk.Frame(root, bg=palette["panel"], height=64)
+    header.pack(fill="x", side="top")
+    header.pack_propagate(False)
+    tk.Label(header, text="KADACHI", bg=palette["panel"], fg=palette["accent"],
+             font=("Segoe UI", 18, "bold")).pack(side="left", padx=(24, 8))
+    tk.Label(header, text="NES EMULATOR", bg=palette["panel"], fg=palette["muted"],
+             font=("Segoe UI", 10, "bold")).pack(side="left", pady=(5, 0))
+    status = tk.Label(header, text="●  RUNNING", bg=palette["panel"], fg=palette["green"],
+                     font=("Segoe UI", 9, "bold"))
+    status.pack(side="right", padx=24)
+
+    body = tk.Frame(root, bg=palette["bg"])
+    body.pack(fill="both", expand=True)
+    sidebar = tk.Frame(body, bg=palette["panel"], width=240)
+    sidebar.pack(fill="y", side="left")
+    sidebar.pack_propagate(False)
+
+    def action_button(parent, label, command, accent=False):
+        return tk.Button(parent, text=label, command=command, anchor="w", padx=14,
+                         bg=palette["accent"] if accent else palette["panel2"],
+                         fg="#17191d" if accent else palette["text"],
+                         activebackground="#ffd07a" if accent else palette["line"],
+                         activeforeground=palette["text"], relief="flat", bd=0,
+                         font=("Segoe UI", 10, "bold"), cursor="hand2")
+
+    tk.Label(sidebar, text="CARTRIDGE", bg=palette["panel"], fg=palette["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=20, pady=(24, 8))
+    current_rom = tk.StringVar(value=Path(rom.path).name if hasattr(rom, "path") else "Loaded cartridge")
+    rom_label = tk.Label(sidebar, textvariable=current_rom, bg=palette["panel"], fg=palette["text"],
+                         font=("Segoe UI", 10), anchor="w", wraplength=195)
+    rom_label.pack(fill="x", padx=20, pady=(0, 14))
+    controls = tk.Frame(sidebar, bg=palette["panel"])
+    controls.pack(fill="x", padx=14)
     source_image = tk.PhotoImage(width=256, height=240)
     display_image = source_image
-    label = tk.Label(root, image=display_image, bd=0, bg="black")
+    screen_wrap = tk.Frame(body, bg=palette["bg"])
+    screen_wrap.pack(expand=True, fill="both", padx=28, pady=26)
+    screen_frame = tk.Frame(screen_wrap, bg="#07080a", highlightthickness=1,
+                            highlightbackground=palette["line"])
+    screen_frame.pack(expand=True, fill="both")
+    label = tk.Label(screen_frame, image=display_image, bd=0, bg="#07080a")
     label.pack(expand=True, fill="both")
+
+    def set_status(text, colour=palette["green"]):
+        status.configure(text="●  " + text, fg=colour)
+
+    def save_state(slot):
+        try:
+            with open(Path(f"kadachi_state_{slot}.sav"), "wb") as state_file:
+                pickle.dump({"rom": rom, "bus": bus, "cpu": cpu}, state_file)
+            set_status(f"STATE {slot} SAVED")
+        except Exception as error:
+            messagebox.showerror("Save state failed", str(error), parent=root)
+
+    def load_state(slot):
+        nonlocal bus, cpu, rom, cycle_target, deadline
+        path = Path(f"kadachi_state_{slot}.sav")
+        if not path.exists():
+            set_status(f"SLOT {slot} EMPTY", "#ff8f8f")
+            return
+        try:
+            with open(path, "rb") as state_file:
+                saved = pickle.load(state_file)
+            rom, bus, cpu = saved["rom"], saved["bus"], saved["cpu"]
+            current_rom.set(Path(rom.path).name if hasattr(rom, "path") else "Loaded cartridge")
+            cycle_target, deadline = float(cpu.cycles), time.perf_counter()
+            set_status(f"STATE {slot} LOADED")
+        except Exception as error:
+            messagebox.showerror("Load state failed", str(error), parent=root)
+
+    def open_rom():
+        nonlocal bus, cpu, rom, cycle_target, deadline
+        path = filedialog.askopenfilename(parent=root, title="Open NES cartridge",
+                                          filetypes=[("NES ROM", "*.nes"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            rom = Rom.load(path)
+            bus = Bus(rom); cpu = CPU(bus); cpu.reset()
+            current_rom.set(Path(path).name)
+            cycle_target, deadline = float(cpu.cycles), time.perf_counter()
+            set_status("RUNNING")
+        except Exception as error:
+            messagebox.showerror("Could not open ROM", str(error), parent=root)
+
+    action_button(controls, "＋  OPEN CARTRIDGE", open_rom, True).pack(fill="x", pady=4)
+    action_button(controls, "↻  RESTART GAME", lambda: (cpu.reset(), set_status("RESTARTED"))).pack(fill="x", pady=4)
+    tk.Label(sidebar, text="SAVE STATES", bg=palette["panel"], fg=palette["muted"],
+             font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=20, pady=(28, 8))
+    for slot in range(1, 5):
+        row = tk.Frame(sidebar, bg=palette["panel"])
+        row.pack(fill="x", padx=14, pady=3)
+        tk.Label(row, text=f"SLOT {slot}", width=8, anchor="w", bg=palette["panel"],
+                 fg=palette["text"], font=("Segoe UI", 9, "bold")).pack(side="left", padx=6)
+        tk.Button(row, text="SAVE", command=lambda s=slot: save_state(s), bg=palette["panel2"], fg=palette["text"], relief="flat", bd=0).pack(side="right", padx=2)
+        tk.Button(row, text="LOAD", command=lambda s=slot: load_state(s), bg=palette["panel2"], fg=palette["text"], relief="flat", bd=0).pack(side="right", padx=2)
+    tk.Label(sidebar, text="F5–F8  save state   •   Shift+F5–F8  load state", bg=palette["panel"], fg=palette["muted"], font=("Segoe UI", 8), wraplength=200, justify="left").pack(anchor="w", padx=20, pady=(24, 0))
 
     def scale_image():
         nonlocal display_image
@@ -835,6 +937,9 @@ def run_window(rom: Rom) -> None:
     root.bind_all("<KeyRelease>", key_up)
     root.bind("<KeyPress>", key_down)
     root.bind("<KeyRelease>", key_up)
+    for index, key in enumerate(("F5", "F6", "F7", "F8"), start=1):
+        root.bind_all(f"<{key}>", lambda _event, s=index: save_state(s))
+        root.bind_all(f"<Shift-{key}>", lambda _event, s=index: load_state(s))
     label.bind("<Button-1>", lambda _event: root.focus_force())
     root.focus_force()
 

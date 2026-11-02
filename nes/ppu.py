@@ -80,6 +80,13 @@ class PPU:
         self.frame_counter = 0
         self.split_line: int | None = None
         self.hud_scroll: tuple[int, int, int] | None = None
+        # Per-frame scroll history: (first_scanline, scroll_x, scroll_y, base_nametable).
+        # Games such as Super Mario Bros. rewrite the scroll registers mid-frame
+        # (status bar vs. playfield), so rendering must replay these writes instead
+        # of using whatever the registers hold when the host happens to draw.
+        self._scroll_events: list[tuple[int, int, int, int]] = [(0, 0, 0, 0)]
+        # Copy of everything the picture depends on, taken when a PPU frame ends.
+        self._snapshot: dict | None = None
 
     def begin_frame(self) -> None:
         self.nmi_pending = False
@@ -110,6 +117,15 @@ class PPU:
                 self.nmi_pending = bool(self.control & 0x80)
                 self.frame_ready = True
                 self.frame_counter += 1
+                self._snapshot = {
+                    "oam": bytearray(self.oam),
+                    "vram": bytearray(self.vram),
+                    "palette": bytearray(self.palette),
+                    "control": self.control,
+                    "mask": self.mask,
+                    "scroll_events": list(self._scroll_events),
+                    "chr_events": list(self._chr_events),
+                }
             elif self.scanline == 261:
                 # Pre-render line: vblank, sprite-0 hit and overflow all clear.
                 self.status &= 0x1F
@@ -119,6 +135,7 @@ class PPU:
                 self._last_chr_events = self._chr_events
                 self._chr_events = [(0, self._chr_rom)]
                 self.scanline = 0
+                self._scroll_events = [(0, self.scroll_x, self.scroll_y, self._base_nametable())]
                 # OAM/VRAM/scroll were prepared during vblank, so work out
                 # now where sprite 0 will overlap the background this frame.
                 self.sprite_zero_hit_at = self._find_sprite_zero_hit()
@@ -153,6 +170,7 @@ class PPU:
             self.temp_address = (self.temp_address & ~0x0C00) | ((value & 3) << 10)
             if self.status & 0x80 and value & 0x80:
                 self.nmi_pending = True
+            self._record_scroll()
         elif register == 1: self.mask = value
         elif register == 3: self.oam_address = value
         elif register == 4:
@@ -161,12 +179,28 @@ class PPU:
             if not self.address_latch: self.scroll_x = value
             else: self.scroll_y = value
             self.address_latch = not self.address_latch
+            self._record_scroll()
         elif register == 6:
             if not self.address_latch: self.temp_address = (value & 0x3F) << 8
             else: self.temp_address = (self.temp_address & 0x3F00) | value; self.address = self.temp_address
             self.address_latch = not self.address_latch
         elif register == 7:
             self._write_vram(self.address, value); self.address = (self.address + (32 if self.control & 4 else 1)) & 0x3FFF
+
+    def _record_scroll(self) -> None:
+        """Remember the scroll state from the scanline where a register write takes effect."""
+        if self.scanline >= 240:
+            return  # vblank writes are picked up when the next frame starts
+        # A write after the end of the visible part of a line only affects the next line.
+        line = self.scanline + (1 if self.dot >= 257 else 0)
+        if line >= 240:
+            return
+        state = (line, self.scroll_x, self.scroll_y, self._base_nametable())
+        events = self._scroll_events
+        if events[-1][0] == line:
+            events[-1] = state
+        elif events[-1][1:] != state[1:]:
+            events.append(state)
 
     def _read_vram(self, address: int) -> int:
         address &= 0x3FFF
@@ -209,19 +243,37 @@ class PPU:
                         self.frame[screen_y * 256 + screen_x] = self.palette[(palette_id * 4 + colour) & 0x1F] if colour else self.palette[0]
 
     def render_frame(self, mirroring: str = "horizontal") -> None:
-        """Render the frame, splitting at the sprite-0 line so the HUD stays fixed."""
+        """Render the most recently completed PPU frame.
+
+        The picture is built from a snapshot taken at the end of the visible
+        frame, with the background drawn in horizontal bands that follow the
+        scroll writes the game made while the frame was being displayed
+        (e.g. a fixed status bar above a scrolling playfield).
+        """
         self.mirroring = mirroring
-        self._render_chr_events = self._last_chr_events or self._chr_events
-        self.frame[:] = bytes([self.palette[0]]) * len(self.frame)
-        if self.mask & 0x08:
-            current = (self.scroll_x, self.scroll_y, self._base_nametable())
-            split = self.split_line
-            if split is not None and 0 < split < 240 and self.hud_scroll is not None:
-                self._draw_background(*self.hud_scroll, 0, split)
-                self._draw_background(*current, split, 240)
-            else:
-                self._draw_background(*current, 0, 240)
-        self.render_sprites()
+        snap = self._snapshot
+        if snap is None:
+            snap = {
+                "oam": self.oam, "vram": self.vram, "palette": self.palette,
+                "control": self.control, "mask": self.mask,
+                "scroll_events": [(0, self.scroll_x, self.scroll_y, self._base_nametable())],
+                "chr_events": self._chr_events,
+            }
+        live = (self.oam, self.vram, self.palette, self.control, self.mask)
+        self.oam, self.vram, self.palette = snap["oam"], snap["vram"], snap["palette"]
+        self.control, self.mask = snap["control"], snap["mask"]
+        try:
+            self._render_chr_events = snap["chr_events"]
+            self.frame[:] = bytes([self.palette[0]]) * len(self.frame)
+            if self.mask & 0x08:
+                events = snap["scroll_events"]
+                for index, (line, scroll_x, scroll_y, base_nt) in enumerate(events):
+                    end_line = events[index + 1][0] if index + 1 < len(events) else 240
+                    if end_line > line:
+                        self._draw_background(scroll_x, scroll_y, base_nt, line, end_line)
+            self.render_sprites()
+        finally:
+            self.oam, self.vram, self.palette, self.control, self.mask = live
         # Rendering temporarily walks historical CHR banks; restore the bank
         # active at the end of the frame for the next frame's initial state.
         if self._chr_events and self._chr_rom is not self._chr_events[-1][1]:
