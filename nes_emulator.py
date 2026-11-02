@@ -9,7 +9,7 @@ import zlib
 import time
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 import pickle
 import wave
 import io
@@ -842,11 +842,26 @@ def run_window(rom: Rom) -> None:
 
     def save_state(slot):
         try:
+            # CPU dispatch and the APU clock hook are runtime closures, so
+            # serialize the machine data and CPU registers instead of the CPU
+            # object itself.
+            apu_now_fn = bus.apu.now_fn
+            bus.apu.now_fn = None
+            snapshot = {
+                "rom": rom,
+                "bus": bus,
+                "cpu": {name: getattr(cpu, name) for name in
+                        ("a", "x", "y", "sp", "p", "pc", "cycles")},
+            }
             with open(Path(f"kadachi_state_{slot}.sav"), "wb") as state_file:
-                pickle.dump({"rom": rom, "bus": bus, "cpu": cpu}, state_file)
+                pickle.dump(snapshot, state_file)
+            bus.apu.now_fn = apu_now_fn
             set_status(f"STATE {slot} SAVED")
         except Exception as error:
-            messagebox.showerror("Save state failed", str(error), parent=root)
+            if 'apu_now_fn' in locals():
+                bus.apu.now_fn = apu_now_fn
+            print(f"Save state failed: {error}", flush=True)
+            traceback.print_exc()
 
     def load_state(slot):
         nonlocal bus, cpu, rom, cycle_target, deadline
@@ -857,12 +872,16 @@ def run_window(rom: Rom) -> None:
         try:
             with open(path, "rb") as state_file:
                 saved = pickle.load(state_file)
-            rom, bus, cpu = saved["rom"], saved["bus"], saved["cpu"]
+            rom, bus = saved["rom"], saved["bus"]
+            cpu = CPU(bus)
+            for name, value in saved["cpu"].items():
+                setattr(cpu, name, value)
             current_rom.set(Path(rom.path).name if hasattr(rom, "path") else "Loaded cartridge")
             cycle_target, deadline = float(cpu.cycles), time.perf_counter()
             set_status(f"STATE {slot} LOADED")
         except Exception as error:
-            messagebox.showerror("Load state failed", str(error), parent=root)
+            print(f"Load state failed: {error}", flush=True)
+            traceback.print_exc()
 
     def open_rom():
         nonlocal bus, cpu, rom, cycle_target, deadline
@@ -877,7 +896,8 @@ def run_window(rom: Rom) -> None:
             cycle_target, deadline = float(cpu.cycles), time.perf_counter()
             set_status("RUNNING")
         except Exception as error:
-            messagebox.showerror("Could not open ROM", str(error), parent=root)
+            print(f"Could not open ROM: {error}", flush=True)
+            traceback.print_exc()
 
     action_button(controls, "＋  OPEN CARTRIDGE", open_rom, True).pack(fill="x", pady=4)
     action_button(controls, "↻  RESTART GAME", lambda: (cpu.reset(), set_status("RESTARTED"))).pack(fill="x", pady=4)
@@ -949,24 +969,8 @@ def run_window(rom: Rom) -> None:
     deadline = time.perf_counter()
     skipped = 0
 
-    # CHANGED: diagnostics. Set DEBUG_AUDIO = False once audio works.
-    DEBUG_AUDIO = True
-    fps_stats = {"frames": 0, "t": time.perf_counter()}
-
     def draw_frame():
         nonlocal pending_buttons, deadline, skipped, cycle_target
-        # CHANGED: once-a-second FPS / audio status line.
-        if DEBUG_AUDIO:
-            fps_stats["frames"] += 1
-            t = time.perf_counter()
-            if t - fps_stats["t"] >= 1.0:
-                backend = "sounddevice" if sounddevice else "winsound" if winsound else "none"
-                apu = bus.apu
-                print(f"FPS: {fps_stats['frames'] / (t - fps_stats['t']):.1f} | "
-                      f"audio buffer: {len(stream_buffer)} bytes | backend: {backend} | "
-                      f"enabled: {apu.enabled[:4]} | length: {apu.length}", flush=True)
-                fps_stats["frames"] = 0
-                fps_stats["t"] = t
         try:
             bus.ppu_device.begin_frame()
             bus.set_controller(0, sum(keys[k] for k in pressed) | pending_buttons)
